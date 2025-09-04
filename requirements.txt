@@ -1,0 +1,5 @@
+Flask>=2.3,<3.0
+gunicorn>=21.2
+pandas>=2.0
+pandasdmx>=1.8
+msal>=1.28
