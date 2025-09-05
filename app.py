@@ -8,7 +8,7 @@ Created on Thu Sep  4 19:02:07 2025
 # -*- coding: utf-8 -*-
 import os, re, json, traceback
 import pandas as pd
-import sdmx
+import pandasdmx as sdmx
 from flask import Flask, request, Response, jsonify
 
 # ========= MSAL：设备码登录 + 缓存 + 静默续期 =========
@@ -246,3 +246,4 @@ def api_il_wide():
 if __name__ == "__main__":
     # 本地调试
     app.run(host="0.0.0.0", port=8000, debug=False)
+
