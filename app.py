@@ -141,17 +141,46 @@ def sort_key_for_date(date_str: str, freq: str) -> int:
     return ts.toordinal() if pd.notnull(ts) else -10**12
 
 # ===== 取数（pandasdmx + IMF）=====
-import io
+import io, math
 import requests
 
 IMF_BASE_URL = os.getenv("IMF_BASE_URL", "https://sdmxcentral.imf.org/ws/public/sdmxapi/rest")
 
-def _get_sdmx_bytes(url, headers, params):
-    """请求 SDMX 数据，返回 bytes；对 404/500 做兜底重试。"""
+def _http_get_sdmx(url, headers, params):
+    """单次请求；对 404/500/501 抛出 HTTPError（上层决定是否重试/换路径）"""
     r = requests.get(url, headers=headers, params=params, timeout=60)
     if r.status_code >= 400:
         raise requests.HTTPError(f"{r.status_code} for {url}", response=r)
     return r.content
+
+def _try_fetch_block(dataset, key_str, headers, params):
+    """
+    兼容两种路径：
+      1) .../data/IMF/{dataset}/{key}
+      2) .../data/{dataset}/{key}
+    返回 bytes
+    """
+    paths = [
+        f"{IMF_BASE_URL}/data/IMF/{dataset}/{key_str}",
+        f"{IMF_BASE_URL}/data/{dataset}/{key_str}",
+    ]
+    last_err = None
+    for u in paths:
+        try:
+            return _http_get_sdmx(u, headers, params)
+        except requests.HTTPError as e:
+            last_err = e
+            # 只有 404/500/501 我们换一个路径重试；其他错误直接抛
+            code = getattr(e.response, "status_code", None)
+            if code not in (404, 500, 501):
+                raise
+            continue
+    # 两个路径都失败
+    raise RuntimeError(f"IMF data endpoint failed: {last_err}")
+
+def _chunked(seq, size):
+    for i in range(0, len(seq), size):
+        yield seq[i:i+size]
 
 def fetch_il_wide(
     dataset=DATASET,
@@ -160,75 +189,77 @@ def fetch_il_wide(
     start=DEFAULT_START,
     indicators=None
 ) -> pd.DataFrame:
-    # 1) 指标集合
+    # —— 指标集合 —— #
     inds = indicators if indicators is not None else INDICATORS_DEFAULT
     if not inds:
         return pd.DataFrame(columns=["Date"])
-    ind_key = "+".join(inds)
 
-    # 2) 位置键：FREQUENCY.COUNTRY.INDICATOR
-    key = f"{freq}.{country}.{ind_key}"
-
-    # 3) 请求参数与头（要求 XML 以便 pandasdmx 解析）
+    # —— 公共头与参数（显式要求 SDMX 2.1 XML）—— #
     H = _auth_header()
-    H.setdefault("Accept", "application/vnd.sdmx.structure+xml, application/vnd.sdmx.data+csv, application/xml;q=0.9, */*;q=0.1")
+    H.setdefault("Accept", "application/vnd.sdmx.data+xml;version=2.1, application/xml;q=0.9, */*;q=0.1")
     params = {
         "startPeriod": start,
         "detail": "dataonly",
-        # "compress": "true",  # 如需压缩可开启
+        # "compress": "true",  # 如需启用压缩可打开
     }
 
-    # 4) 先走带 agency 的路径，再回退到不带 agency 的
-    urls_to_try = [
-        f"{IMF_BASE_URL}/data/IMF/{dataset}/{key}",  # 优先：/data/IMF/IL/...
-        f"{IMF_BASE_URL}/data/{dataset}/{key}",      # 回退：/data/IL/...
-    ]
+    # —— 分批：每批最多 6 个指标（可按需调整）—— #
+    batch_size = int(os.getenv("BATCH_SIZE", "6"))
 
-    last_err = None
-    content = None
-    for u in urls_to_try:
-        try:
-            content = _get_sdmx_bytes(u, headers=H, params=params)
-            last_err = None
-            break
-        except requests.HTTPError as e:
-            last_err = e
+    frames = []
+    for batch in _chunked(inds, batch_size):
+        ind_key = "+".join(batch)                 # INDICATOR 位置的复合键：ID1+ID2+...
+        key_str = f"{freq}.{country}.{ind_key}"   # 维度顺序：FREQUENCY.COUNTRY.INDICATOR
+
+        content = _try_fetch_block(dataset, key_str, headers=H, params=params)
+
+        # 解析为 pandasdmx Message
+        msg = sdmx.read_sdmx(io.BytesIO(content))
+        obj = sdmx.to_pandas(msg)
+        if obj is None or (hasattr(obj, "size") and obj.size == 0):
             continue
 
-    if last_err is not None:
-        # 把更清晰的错误抛出去，便于接口返回 JSON
-        raise RuntimeError(f"IMF data endpoint failed: {last_err}")
+        df = obj.rename("value").reset_index() if isinstance(obj, pd.Series) else obj.reset_index()
 
-    # 5) 解析 SDMX 到 pandas
-    msg = sdmx.read_sdmx(io.BytesIO(content))
-    obj = sdmx.to_pandas(msg)
-    if obj is None or (hasattr(obj, "size") and obj.size == 0):
+        # 只留必要列
+        need = [c for c in ["TIME_PERIOD","FREQUENCY","COUNTRY","INDICATOR","value"] if c in df.columns]
+        df = df[need].copy()
+
+        # 统一 ID
+        for c in ("COUNTRY","INDICATOR","FREQUENCY"):
+            if c in df.columns:
+                df[c] = df[c].map(_code_id)
+
+        # 双保险过滤
+        if "FREQUENCY" in df.columns:
+            df = df[df["FREQUENCY"].astype(str).str.upper().eq(freq)]
+        if "COUNTRY" in df.columns:
+            df = df[df["COUNTRY"].astype(str).str.upper().eq(country)]
+
+        if df.empty:
+            continue
+
+        # 规范时间
+        df["Date"] = normalize_timeperiod(df["TIME_PERIOD"], freq)
+
+        # 这一批转宽表
+        w = df.pivot_table(index="Date", columns="INDICATOR", values="value", aggfunc="first").reset_index()
+        frames.append(w)
+
+    if not frames:
         return pd.DataFrame(columns=["Date"])
 
-    df = obj.rename("value").reset_index() if isinstance(obj, pd.Series) else obj.reset_index()
+    # —— 合并所有批次（按 Date 外连接）—— #
+    out = frames[0]
+    for w in frames[1:]:
+        out = out.merge(w, on="Date", how="outer")
 
-    # 6) 只留必要列
-    need = [c for c in ["TIME_PERIOD","FREQUENCY","COUNTRY","INDICATOR","value"] if c in df.columns]
-    df = df[need].copy()
+    # 排序 + 去全空列
+    out["__sort"] = out["Date"].map(lambda x: sort_key_for_date(x, freq))
+    out = out.sort_values("__sort").drop(columns="__sort").reset_index(drop=True)
+    keep = ["Date"] + [c for c in out.columns if c != "Date" and pd.to_numeric(out[c], errors="coerce").notna().any()]
+    return out[keep]
 
-    # 7) 维度值统一 & 过滤（双保险）
-    for c in ("COUNTRY","INDICATOR","FREQUENCY"):
-        if c in df.columns:
-            df[c] = df[c].map(_code_id)
-    if "FREQUENCY" in df.columns:
-        df = df[df["FREQUENCY"].astype(str).str.upper().eq(freq)]
-    if "COUNTRY" in df.columns:
-        df = df[df["COUNTRY"].astype(str).str.upper().eq(country)]
-    if df.empty:
-        return pd.DataFrame(columns=["Date"])
-
-    # 8) 规范时间、转宽表、排序、去全空列
-    df["Date"] = normalize_timeperiod(df["TIME_PERIOD"], freq)
-    wide = df.pivot_table(index="Date", columns="INDICATOR", values="value", aggfunc="first").reset_index()
-    wide["__sort"] = wide["Date"].map(lambda x: sort_key_for_date(x, freq))
-    wide = wide.sort_values("__sort").drop(columns="__sort").reset_index(drop=True)
-    keep = ["Date"] + [c for c in wide.columns if c != "Date" and pd.to_numeric(wide[c], errors="coerce").notna().any()]
-    return wide[keep]
 
 # ===== Flask =====
 app = Flask(__name__)
@@ -302,6 +333,7 @@ def api_il_wide():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=False)
+
 
 
 
