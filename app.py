@@ -143,9 +143,11 @@ def sort_key_for_date(date_str: str, freq: str) -> int:
 def fetch_il_wide(dataset=DATASET, country=DEFAULT_COUNTRY, freq=DEFAULT_FREQ, start=DEFAULT_START, indicators=None) -> pd.DataFrame:
     imf = sdmx.Request("IMF")
 
-    flow = imf.dataflow(dataset)
+    # 关键：元数据请求也要带 Authorization 头
+    flow = imf.dataflow(dataset, headers=_auth_header())
     dsd_id = flow.dataflow[dataset].structure.id
-    sm = imf.datastructure(dsd_id, params={"references": "descendants"})
+
+    sm = imf.datastructure(dsd_id, params={"references": "descendants"}, headers=_auth_header())
     dsd_obj = sm.get(dsd_id)
     clmap = getattr(sm, "codelist", {})
 
@@ -165,11 +167,12 @@ def fetch_il_wide(dataset=DATASET, country=DEFAULT_COUNTRY, freq=DEFAULT_FREQ, s
 
     key = {"FREQUENCY": freq, "COUNTRY": country, "INDICATOR": inds}
 
+    # 取数据：这里本来就带了授权头
     dm = imf.data(
         dataset,
         key=key,
         params={"startPeriod": start, "detail": "dataonly"},
-        headers=_auth_header(),   # 带 IMF 授权
+        headers=_auth_header(),
         dsd=dsd_obj,
     )
 
@@ -200,6 +203,7 @@ def fetch_il_wide(dataset=DATASET, country=DEFAULT_COUNTRY, freq=DEFAULT_FREQ, s
 
     keep = ["Date"] + [c for c in wide.columns if c != "Date" and pd.to_numeric(wide[c], errors="coerce").notna().any()]
     return wide[keep]
+
 
 # ===== Flask =====
 app = Flask(__name__)
@@ -273,3 +277,4 @@ def api_il_wide():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=False)
+
