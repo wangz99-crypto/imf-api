@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 import os, re, json, base64, io, traceback
 import pandas as pd
-import pandasdmx as sdmx
+import sdmx            # ← 用你本地那套
+import requests
 import requests
 from flask import Flask, request, Response, jsonify
 from msal import PublicClientApplication, SerializableTokenCache
@@ -143,78 +144,6 @@ def sort_key_for_date(date_str: str, freq: str) -> int:
     return ts.toordinal() if pd.notnull(ts) else -10**12
 
 # ===================== SDMX 拉数（多路由/多顺序/递归降级） =====================
-def _http_get_sdmx(url, headers, params):
-    r = requests.get(url, headers=headers, params=params, timeout=60)
-    if r.status_code >= 400:
-        raise requests.HTTPError(f"{r.status_code} for {url}", response=r)
-    return r.content
-
-def _try_one_key(dataset, key_str, headers, params):
-    urls = [
-        f"{IMF_BASE_URL}/data/IMF/{dataset}/{key_str}",
-        f"{IMF_BASE_URL}/data/{dataset}/{key_str}",
-    ]
-    last_err = None
-    for u in urls:
-        try:
-            return _http_get_sdmx(u, headers, params)
-        except requests.HTTPError as e:
-            code = getattr(e.response, "status_code", None)
-            if code in (404, 500, 501):
-                last_err = e
-                continue
-            raise
-    raise last_err or RuntimeError("Unknown error")
-
-def _fetch_batch(dataset, country, freq, indicators, headers, params):
-    """
-    针对一批 indicator：
-      1) 尝试维度顺序 A：FREQ.COUNTRY.INDICATOR
-      2) 尝试维度顺序 B：COUNTRY.FREQ.INDICATOR
-      3) 若失败且批量>1 → 递归二分
-      4) 若==1 仍失败 → 抛错
-    成功返回该批次的宽表 DataFrame
-    """
-    ind_key = "+".join(indicators)
-    key_A = f"{freq}.{country}.{ind_key}"
-    key_B = f"{country}.{freq}.{ind_key}"
-
-    for key_str in (key_A, key_B):
-        try:
-            content = _try_one_key(dataset, key_str, headers, params)
-            msg = sdmx.read_sdmx(io.BytesIO(content))
-            obj = sdmx.to_pandas(msg)
-            if obj is None or (hasattr(obj, "size") and obj.size == 0):
-                raise RuntimeError("empty")
-            df = obj.rename("value").reset_index() if isinstance(obj, pd.Series) else obj.reset_index()
-            need = [c for c in ["TIME_PERIOD","FREQUENCY","COUNTRY","INDICATOR","value"] if c in df.columns]
-            df = df[need].copy()
-            for c in ("COUNTRY","INDICATOR","FREQUENCY"):
-                if c in df.columns:
-                    df[c] = df[c].map(_code_id)
-            df["Date"] = normalize_timeperiod(df["TIME_PERIOD"], freq)
-            wide = df.pivot_table(index="Date", columns="INDICATOR", values="value", aggfunc="first").reset_index()
-            return wide
-        except requests.HTTPError as e:
-            code = getattr(e.response, "status_code", None)
-            if code not in (404, 500, 501):
-                raise
-            last_err = e
-        except Exception:
-            last_err = RuntimeError("parse_failed")
-
-    if len(indicators) > 1:
-        mid = len(indicators) // 2
-        left  = _fetch_batch(dataset, country, freq, indicators[:mid], headers, params)
-        right = _fetch_batch(dataset, country, freq, indicators[mid:], headers, params)
-        if left is None and right is None:
-            raise last_err
-        if left is None:  return right
-        if right is None: return left
-        return left.merge(right, on="Date", how="outer")
-
-    raise last_err if 'last_err' in locals() else RuntimeError("fetch failed")
-
 def fetch_il_wide(
     dataset=DATASET,
     country=DEFAULT_COUNTRY,
@@ -222,40 +151,76 @@ def fetch_il_wide(
     start=DEFAULT_START,
     indicators=None
 ) -> pd.DataFrame:
+    # 用 IMF_DATA 源（这就是你本地能成功的配置）
+    imf = sdmx.Client("IMF_DATA", timeout=60)
+
+    H = _auth_header()
+
+    # 1) dataflow 带授权（有些 IMF 端点没带头会 404）
+    flow = imf.dataflow(dataset, headers=H)
+    # dataset 可能带 agency 前缀，统一取我们要的 key
+    if dataset in flow.dataflow:
+        df_key = dataset
+    else:
+        # 宽松匹配：IMF:IL 这种
+        cands = [k for k in flow.dataflow.keys() if k.split(":")[-1] == dataset]
+        if not cands:
+            raise RuntimeError(f"Dataflow '{dataset}' not found.")
+        df_key = cands[0]
+
+    dsd_id = flow.dataflow[df_key].structure.id
+
+    # 2) datastructure 同样带授权
+    sm = imf.datastructure(dsd_id, params={"references": "descendants"}, headers=H)
+    dsd_obj = sm.get(dsd_id)
+
+    # 3) 指标集合：用传入的或默认列表（避免再去查 codelist 造成 404）
     inds = indicators if indicators is not None else INDICATORS_DEFAULT
     if not inds:
         return pd.DataFrame(columns=["Date"])
 
-    H = _auth_header()
-    H.setdefault("Accept", "application/vnd.sdmx.data+xml;version=2.1, application/xml;q=0.9, */*;q=0.1")
-    params = {"startPeriod": start, "detail": "dataonly"}
+    # 4) 拉数（同样带授权；传 dsd 避免内部再访问 dataflow）
+    key = {"FREQUENCY": freq, "COUNTRY": country, "INDICATOR": inds}
+    dm = imf.data(
+        dataset,
+        key=key,
+        params={"startPeriod": start, "detail": "dataonly"},
+        headers=H,
+        dsd=dsd_obj,     # 关键：提供 dsd，避免库内部再去 dataflow
+    )
 
-    frames = []
-    for i in range(0, len(inds), BATCH_SIZE):
-        sub = inds[i:i+BATCH_SIZE]
-        try:
-            w = _fetch_batch(dataset, country, freq, sub, headers=H, params=params)
-            if w is not None and not w.empty:
-                frames.append(w)
-        except Exception:
-            # 该批拿不到就跳过，避免整批失败
-            continue
-
-    if not frames:
+    # 5) 转成 pandas
+    obj = sdmx.to_pandas(dm)
+    if obj is None or (hasattr(obj, "size") and obj.size == 0):
         return pd.DataFrame(columns=["Date"])
 
-    out = frames[0]
-    for w in frames[1:]:
-        out = out.merge(w, on="Date", how="outer")
+    df = obj.rename("value").reset_index() if isinstance(obj, pd.Series) else obj.reset_index()
 
-    out["__sort"] = out["Date"].map(lambda x: sort_key_for_date(x, freq))
-    out = out.sort_values("__sort").drop(columns="__sort").reset_index(drop=True)
+    # 6) 只留必要列
+    need = [c for c in ["TIME_PERIOD","FREQUENCY","COUNTRY","INDICATOR","value"] if c in df.columns]
+    df = df[need].copy()
 
-    keep = ["Date"] + [c for c in out.columns if c != "Date" and pd.to_numeric(out[c], errors="coerce").notna().any()]
-    out = out[keep]
-    out = out.loc[:, ~out.columns.duplicated()].copy()
+    # 7) 统一 ID + 双保险过滤
+    for c in ("COUNTRY","INDICATOR","FREQUENCY"):
+        if c in df.columns:
+            df[c] = df[c].map(_code_id)
 
-    return out
+    if "FREQUENCY" in df.columns:
+        df = df[df["FREQUENCY"].astype(str).str.upper().eq(freq)]
+    if "COUNTRY" in df.columns:
+        df = df[df["COUNTRY"].astype(str).str.upper().eq(country)]
+    if df.empty:
+        return pd.DataFrame(columns=["Date"])
+
+    # 8) 规范时间、转宽表、排序与清洗
+    df["Date"] = normalize_timeperiod(df["TIME_PERIOD"], freq)
+    wide = df.pivot_table(index="Date", columns="INDICATOR", values="value", aggfunc="first").reset_index()
+    wide["__sort"] = wide["Date"].map(lambda x: sort_key_for_date(x, freq))
+    wide = wide.sort_values("__sort").drop(columns="__sort").reset_index(drop=True)
+
+    keep = ["Date"] + [c for c in wide.columns if c != "Date" and pd.to_numeric(wide[c], errors="coerce").notna().any()]
+    return wide[keep]
+
 
 # ===================== Flask 应用 & 路由 =====================
 app = Flask(__name__)
@@ -359,3 +324,4 @@ def api_il_wide():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=False)
+
