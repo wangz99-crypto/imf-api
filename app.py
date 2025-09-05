@@ -1,13 +1,11 @@
 # -*- coding: utf-8 -*-
-import os, re, json, traceback
+import os, re, json, base64, traceback
 import pandas as pd
 import pandasdmx as sdmx
 from flask import Flask, request, Response, jsonify
-
-# ===== MSAL（设备码登录 + 缓存 + 静默续期）=====
 from msal import PublicClientApplication, SerializableTokenCache
 
-# ---- IMF Azure B2C 配置 ----
+# ===== IMF B2C 基本配置 =====
 CLIENT_ID = os.getenv("IMF_CLIENT_ID", "446ce2fa-88b1-436c-b8e6-94491ca4f6fb")
 AUTHORITY = os.getenv(
     "IMF_AUTHORITY",
@@ -18,9 +16,8 @@ SCOPE = os.getenv(
     "https://imfprdb2c.onmicrosoft.com/4042e178-3e2f-4ff9-ac38-1276c901c13d/iData.Login",
 )
 
-# ---- 缓存与临时文件路径：可写性自动兜底 ----
+# ===== 路径兜底：先 /var/data，失败回退到源码目录，再不行 /tmp =====
 def _ensure_writable(path: str, fallback_dir="/opt/render/project/src", last_resort="/tmp") -> str:
-    """确保 path 所在目录可写；不可写则回退到 fallback_dir，再不行回退 /tmp。"""
     d = os.path.dirname(path) or "."
     try:
         os.makedirs(d, exist_ok=True)
@@ -38,9 +35,17 @@ def _ensure_writable(path: str, fallback_dir="/opt/render/project/src", last_res
             return os.path.join(last_resort, os.path.basename(path))
 
 TOKEN_CACHE_PATH = _ensure_writable(os.getenv("TOKEN_CACHE_PATH", "/var/data/token_cache.json"))
-DEVICE_FLOW_PATH = _ensure_writable(os.getenv("DEVICE_FLOW_PATH", "/var/data/device_flow.json"))
 
-# ---- 初始化 MSAL 应用与缓存 ----
+# ===== 若提供了 TOKEN_CACHE_B64，就在启动时写入文件 =====
+b64 = os.getenv("TOKEN_CACHE_B64")
+if b64 and not os.path.exists(TOKEN_CACHE_PATH):
+    try:
+        with open(TOKEN_CACHE_PATH, "wb") as f:
+            f.write(base64.b64decode(b64))
+    except Exception:
+        pass
+
+# ===== 初始化 MSAL（只用缓存，不交互登录）=====
 _token_cache = SerializableTokenCache()
 if os.path.exists(TOKEN_CACHE_PATH):
     try:
@@ -57,11 +62,14 @@ def _persist_cache():
         pass
 
 def _auth_header():
-    """静默获取/续期 token；若没有有效 token 则抛错。"""
+    """从缓存静默取 token；失败则给出 401 提示你更新缓存。"""
     accts = app_msal.get_accounts()
     res = app_msal.acquire_token_silent([SCOPE], account=accts[0] if accts else None)
     if not res or "access_token" not in res:
-        raise RuntimeError("No valid token in cache. Call /auth/device/start then POST /auth/device/finish once.")
+        raise PermissionError(
+            "No valid token in cache. Please run init_token.py locally and upload token_cache.json "
+            "(or set TOKEN_CACHE_B64)."
+        )
     _persist_cache()
     return {"Authorization": f"{res['token_type']} {res['access_token']}"}
 
@@ -80,7 +88,6 @@ INDICATORS_DEFAULT = [
     "NFAOFA_ACO_NRES_S121","NFAOFL_LT_NRES_S121",
     "USD_OZG_MR","XDR_OZG_MR"
 ]
-FREQ_NAME = {"A": "Annual", "Q": "Quarterly", "M": "Monthly"}
 
 # ===== 工具函数 =====
 def _code_id(v):
@@ -105,7 +112,7 @@ def normalize_timeperiod(series: pd.Series, freq: str) -> pd.Series:
             mo = m.loc[mask, 1].astype(int)
             first_mm = ((mo - 1) // 3) * 3 + 1
             out.loc[mask] = yy.astype(str) + "-" + first_mm.map("{:02d}".format)
-        m2 = out.str_extract(r"^(\d{4})-(\d{2})$", expand=True)
+        m2 = out.str.extract(r"^(\d{4})-(\d{2})$", expand=True)
         mask2 = m2[0].notna()
         if mask2.any():
             yy2 = m2.loc[mask2, 0].astype(int)
@@ -132,7 +139,7 @@ def sort_key_for_date(date_str: str, freq: str) -> int:
     ts = pd.to_datetime(f"{s}-01-01" if freq == "A" else f"{s}-01", errors="coerce")
     return ts.toordinal() if pd.notnull(ts) else -10**12
 
-# ===== 取数主函数（pandasdmx.Request("IMF")）=====
+# ===== 取数（pandasdmx + IMF）=====
 def fetch_il_wide(dataset=DATASET, country=DEFAULT_COUNTRY, freq=DEFAULT_FREQ, start=DEFAULT_START, indicators=None) -> pd.DataFrame:
     imf = sdmx.Request("IMF")
 
@@ -188,76 +195,38 @@ def fetch_il_wide(dataset=DATASET, country=DEFAULT_COUNTRY, freq=DEFAULT_FREQ, s
 
     df["Date"] = normalize_timeperiod(df["TIME_PERIOD"], freq)
     wide = df.pivot_table(index="Date", columns="INDICATOR", values="value", aggfunc="first").reset_index()
-    # 排序
     wide["__sort"] = wide["Date"].map(lambda x: sort_key_for_date(x, freq))
     wide = wide.sort_values("__sort").drop(columns="__sort").reset_index(drop=True)
 
     keep = ["Date"] + [c for c in wide.columns if c != "Date" and pd.to_numeric(wide[c], errors="coerce").notna().any()]
     return wide[keep]
 
-# ===== Flask App =====
+# ===== Flask =====
 app = Flask(__name__)
 
 @app.get("/")
 def index():
-    return jsonify({
-        "service": "IMF IL API",
-        "endpoints": {
-            "health": "/health",
-            "auth_start": "/auth/device/start",
-            "auth_finish": "POST /auth/device/finish",
-            "debug_token": "/debug/token_ok",
-            "data": "/api/il_wide?country=MRT&freq=M&start=2000&format=csv|json"
-        },
-        "token_cache_path": TOKEN_CACHE_PATH,
-        "device_flow_path": DEVICE_FLOW_PATH
-    })
-
-@app.get("/health")
-def health():
     ready = False
     try:
         _ = _auth_header()
         ready = True
     except Exception:
         ready = False
-    return jsonify({"dataset": DATASET, "status": "ok", "token_ready": ready})
+    return jsonify({
+        "service": "IMF IL API (cache-only)",
+        "health": "/health",
+        "data_example": "/api/il_wide?country=MRT&freq=M&start=2000&format=csv",
+        "token_ready": ready,
+        "token_cache_path": TOKEN_CACHE_PATH
+    })
 
-# —— 设备码：开始 —— #
-@app.get("/auth/device/start")
-def auth_device_start():
+@app.get("/health")
+def health():
     try:
-        flow = app_msal.initiate_device_flow(scopes=[SCOPE])
-        if not flow or "user_code" not in flow:
-            return jsonify({"error": "device_flow_failed", "details": flow}), 500
-        with open(DEVICE_FLOW_PATH, "w", encoding="utf-8") as f:
-            json.dump(flow, f)
-        return jsonify({
-            "verification_uri": flow.get("verification_uri") or flow.get("verification_url"),
-            "user_code": flow.get("user_code"),
-            "message": flow.get("message", "Open verification_uri and enter user_code, then call POST /auth/device/finish")
-        })
+        _ = _auth_header()
+        return jsonify({"status":"ok","dataset":DATASET,"token_ready":True})
     except Exception as e:
-        return jsonify({"error": "exception", "message": str(e), "trace": traceback.format_exc().splitlines()[-6:]}), 500
-
-# —— 设备码：结束（需 POST） —— #
-@app.post("/auth/device/finish")
-def auth_device_finish():
-    try:
-        if not os.path.exists(DEVICE_FLOW_PATH):
-            return jsonify({"error": "no_pending_flow", "hint": "Call /auth/device/start first."}), 400
-        flow = json.load(open(DEVICE_FLOW_PATH, "r", encoding="utf-8"))
-        result = app_msal.acquire_token_by_device_flow(flow)  # 阻塞直到完成/超时
-        if "access_token" not in result:
-            return jsonify({"error": "auth_failed", "details": result}), 500
-        _persist_cache()
-        try:
-            os.remove(DEVICE_FLOW_PATH)
-        except Exception:
-            pass
-        return jsonify({"ok": True, "cache_path": TOKEN_CACHE_PATH})
-    except Exception as e:
-        return jsonify({"error": "exception", "message": str(e), "trace": traceback.format_exc().splitlines()[-6:]}), 500
+        return jsonify({"status":"ok","dataset":DATASET,"token_ready":False,"hint":str(e)})
 
 @app.get("/debug/token_ok")
 def debug_token_ok():
@@ -265,18 +234,10 @@ def debug_token_ok():
         _ = _auth_header()
         return jsonify({"ok": True, "cache_path": TOKEN_CACHE_PATH})
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e), "cache_path": TOKEN_CACHE_PATH}), 500
+        return jsonify({"ok": False, "error": str(e), "cache_path": TOKEN_CACHE_PATH}), 401
 
 @app.get("/api/il_wide")
 def api_il_wide():
-    """
-    参数：
-      - country: 默认 MRT
-      - freq: A/Q/M，默认 M
-      - start: 默认 2000
-      - indicators: 逗号分隔（可选；默认 INDICATORS_DEFAULT）
-      - format: csv|json，默认 csv
-    """
     try:
         country = (request.args.get("country") or DEFAULT_COUNTRY).upper().strip()
         freq    = (request.args.get("freq") or DEFAULT_FREQ).upper().strip()
@@ -305,6 +266,8 @@ def api_il_wide():
                 "Cache-Control": "no-store",
             },
         )
+    except PermissionError as e:
+        return jsonify({"error":"no_token","message":str(e)}), 401
     except Exception as e:
         return jsonify({"error": str(e), "trace": traceback.format_exc().splitlines()[-8:]}), 500
 
