@@ -2,6 +2,7 @@
 import os, re, json, base64, traceback
 import pandas as pd
 import pandasdmx as sdmx
+import requests
 from flask import Flask, request, Response, jsonify
 from msal import PublicClientApplication, SerializableTokenCache
 
@@ -298,5 +299,6 @@ def api_il_wide():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=False)
+
 
 
