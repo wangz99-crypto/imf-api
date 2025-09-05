@@ -141,77 +141,51 @@ def sort_key_for_date(date_str: str, freq: str) -> int:
     return ts.toordinal() if pd.notnull(ts) else -10**12
 
 # ===== 取数（pandasdmx + IMF）=====
-def fetch_il_wide(dataset=DATASET, country=DEFAULT_COUNTRY, freq=DEFAULT_FREQ, start=DEFAULT_START, indicators=None) -> pd.DataFrame:
+def fetch_il_wide(
+    dataset=DATASET,
+    country=DEFAULT_COUNTRY,
+    freq=DEFAULT_FREQ,
+    start=DEFAULT_START,
+    indicators=None
+) -> pd.DataFrame:
+    # 直接用 IMF 源；不再请求 dataflow/datastructure
     imf = sdmx.Request("IMF")
     H = _auth_header()
 
-    # ---------- 读取 dataflow，带授权；404 时回退到“全量+本地挑选” ----------
-    try:
-        # 首选：只取指定 dataflow（部分 IMF 端点可能报 404）
-        flow = imf.dataflow(dataset, headers=H)
-    except requests.exceptions.HTTPError as e:
-        if e.response is not None and e.response.status_code == 404:
-            # 回退：取全部 dataflow，再挑 dataset
-            flow = imf.dataflow(headers=H)
-            if dataset not in flow.dataflow:
-                # 有些端点 dataflow 的 key 可能是 'IMF:IL' 这类；做一次宽松匹配
-                candidates = [k for k in flow.dataflow.keys() if k.split(":")[-1] == dataset]
-                if candidates:
-                    dataset_key = candidates[0]
-                else:
-                    raise RuntimeError(f"Dataflow '{dataset}' not found on IMF SDMX.")
-            else:
-                dataset_key = dataset
-        else:
-            raise
-    else:
-        dataset_key = dataset
-
-    dsd_id = flow.dataflow[dataset_key].structure.id
-
-    # ---------- 读取 datastructure，带授权 ----------
-    sm = imf.datastructure(dsd_id, params={"references": "descendants"}, headers=H)
-    dsd_obj = sm.get(dsd_id)
-    clmap = getattr(sm, "codelist", {})
-
-    # ---------- 指标集合 ----------
+    # 指标集合：如果你传了就用你传的；否则用脚本里的 INDICATORS_DEFAULT
     inds = indicators if indicators is not None else INDICATORS_DEFAULT
-    if inds is None:
-        cl_ind = clmap.get("CL_IL_INDICATOR") or clmap.get("IMF.STA:CL_IL_INDICATOR")
-        if not cl_ind:
-            ind_dim = next((d for d in dsd_obj.dimensions.components if d.id.upper()=="INDICATOR"), None)
-            if ind_dim and getattr(ind_dim.local_representation, "enumeration", None):
-                cl_id = ind_dim.local_representation.enumeration.id
-                cl_ind = sm.codelist.get(cl_id)
-        if cl_ind:
-            inds = [ (getattr(c,"id",None) or getattr(c,"code",None)) for c in getattr(cl_ind, "codes", []) ]
-            inds = [str(x) for x in inds if x]
-        else:
-            raise RuntimeError("Cannot load CL_IL_INDICATOR; please set INDICATORS manually.")
+    if not inds or len(inds) == 0:
+        # 最兜底：如果真的没有任何指标，就直接返回空表，避免打空请求
+        return pd.DataFrame(columns=["Date"])
 
-    # ---------- 拉数（也带授权） ----------
+    # 组 key（FREQUENCY、COUNTRY、INDICATOR）
     key = {"FREQUENCY": freq, "COUNTRY": country, "INDICATOR": inds}
+
+    # 直接拉数据（不传 dsd，不走元数据端点），带授权
     dm = imf.data(
-        dataset,  # 注意这里 dataset 仍传 'IL'（IMF 源里会处理）
+        dataset,
         key=key,
         params={"startPeriod": start, "detail": "dataonly"},
         headers=H,
-        dsd=dsd_obj,
     )
 
+    # 转 pandas（不需要 dsd 也能展开出维度 + value）
     obj = sdmx.to_pandas(dm)
     if obj is None or (hasattr(obj, "size") and obj.size == 0):
         return pd.DataFrame(columns=["Date"])
 
     df = obj.rename("value").reset_index() if isinstance(obj, pd.Series) else obj.reset_index()
 
-    need = [c for c in ["TIME_PERIOD","FREQUENCY","COUNTRY","INDICATOR","value"] if c in df.columns]
+    # 只保留必要列（不同端点字段名一致）
+    need = [c for c in ["TIME_PERIOD", "FREQUENCY", "COUNTRY", "INDICATOR", "value"] if c in df.columns]
     df = df[need].copy()
 
-    for c in ("COUNTRY","INDICATOR","FREQUENCY"):
+    # 维度值统一成字符串 ID
+    for c in ("COUNTRY", "INDICATOR", "FREQUENCY"):
         if c in df.columns:
             df[c] = df[c].map(_code_id)
 
+    # 过滤频率、国家（双保险）
     if "FREQUENCY" in df.columns:
         df = df[df["FREQUENCY"].astype(str).str.upper().eq(freq)]
     if "COUNTRY" in df.columns:
@@ -219,13 +193,16 @@ def fetch_il_wide(dataset=DATASET, country=DEFAULT_COUNTRY, freq=DEFAULT_FREQ, s
     if df.empty:
         return pd.DataFrame(columns=["Date"])
 
+    # 规范时间 + 透视成宽表
     df["Date"] = normalize_timeperiod(df["TIME_PERIOD"], freq)
     wide = df.pivot_table(index="Date", columns="INDICATOR", values="value", aggfunc="first").reset_index()
+
+    # 排序 + 去全空列
     wide["__sort"] = wide["Date"].map(lambda x: sort_key_for_date(x, freq))
     wide = wide.sort_values("__sort").drop(columns="__sort").reset_index(drop=True)
-
     keep = ["Date"] + [c for c in wide.columns if c != "Date" and pd.to_numeric(wide[c], errors="coerce").notna().any()]
     return wide[keep]
+
 
 # ===== Flask =====
 app = Flask(__name__)
@@ -299,6 +276,7 @@ def api_il_wide():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=False)
+
 
 
 
