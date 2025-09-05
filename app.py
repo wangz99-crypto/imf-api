@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 import os, re, json, base64, io, traceback
 import pandas as pd
-import sdmx            # ← 用你本地那套
+# 原来（错误）：import sdmx
+import pandasdmx as sdmx
+          # ← 用你本地那套
 import requests
 import requests
 from flask import Flask, request, Response, jsonify
@@ -324,4 +326,5 @@ def api_il_wide():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=False)
+
 
