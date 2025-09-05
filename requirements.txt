@@ -1,5 +1,7 @@
 Flask>=2.3,<3.0
-gunicorn>=21.2
-pandas>=2.0
-pandasdmx>=1.8
-msal>=1.28
+gunicorn>=21,<22
+pandas>=2.1,<2.3
+pandasdmx==1.6.0
+msal>=1.28,<2
+
+
