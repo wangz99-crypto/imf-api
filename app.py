@@ -141,6 +141,11 @@ def sort_key_for_date(date_str: str, freq: str) -> int:
     return ts.toordinal() if pd.notnull(ts) else -10**12
 
 # ===== 取数（pandasdmx + IMF）=====
+import io
+import requests
+
+IMF_BASE_URL = os.getenv("IMF_BASE_URL", "https://sdmxcentral.imf.org/ws/public/sdmxapi/rest")
+
 def fetch_il_wide(
     dataset=DATASET,
     country=DEFAULT_COUNTRY,
@@ -148,44 +153,43 @@ def fetch_il_wide(
     start=DEFAULT_START,
     indicators=None
 ) -> pd.DataFrame:
-    # 直接用 IMF 源；不再请求 dataflow/datastructure
-    imf = sdmx.Request("IMF")
-    H = _auth_header()
-
-    # 指标集合：如果你传了就用你传的；否则用脚本里的 INDICATORS_DEFAULT
+    # 1) 指标集合
     inds = indicators if indicators is not None else INDICATORS_DEFAULT
-    if not inds or len(inds) == 0:
-        # 最兜底：如果真的没有任何指标，就直接返回空表，避免打空请求
+    if not inds:
         return pd.DataFrame(columns=["Date"])
+    ind_key = "+".join(inds)
 
-    # 组 key（FREQUENCY、COUNTRY、INDICATOR）
-    key = {"FREQUENCY": freq, "COUNTRY": country, "INDICATOR": inds}
+    # 2) 构造 SDMX REST /data URL（只打 data，不打 dataflow/datastructure）
+    # 位置键：FREQUENCY.COUNTRY.INDICATOR
+    key = f"{freq}.{country}.{ind_key}"
+    params = {
+        "startPeriod": start,
+        "detail": "dataonly",
+        # 也可以加压缩： "compress": "true"
+    }
+    H = _auth_header()
+    url = f"{IMF_BASE_URL}/{dataset}/{key}"
 
-    # 直接拉数据（不传 dsd，不走元数据端点），带授权
-    dm = imf.data(
-        dataset,
-        key=key,
-        params={"startPeriod": start, "detail": "dataonly"},
-        headers=H,
-    )
+    # 3) 请求 SDMX-ML 数据并解析
+    r = requests.get(url, headers=H, params=params, timeout=60)
+    r.raise_for_status()
 
-    # 转 pandas（不需要 dsd 也能展开出维度 + value）
-    obj = sdmx.to_pandas(dm)
+    # 解析成 pandasdmx Message
+    msg = sdmx.read_sdmx(io.BytesIO(r.content))
+    obj = sdmx.to_pandas(msg)
     if obj is None or (hasattr(obj, "size") and obj.size == 0):
         return pd.DataFrame(columns=["Date"])
 
     df = obj.rename("value").reset_index() if isinstance(obj, pd.Series) else obj.reset_index()
 
-    # 只保留必要列（不同端点字段名一致）
-    need = [c for c in ["TIME_PERIOD", "FREQUENCY", "COUNTRY", "INDICATOR", "value"] if c in df.columns]
+    # 4) 只留必要列
+    need = [c for c in ["TIME_PERIOD","FREQUENCY","COUNTRY","INDICATOR","value"] if c in df.columns]
     df = df[need].copy()
 
-    # 维度值统一成字符串 ID
-    for c in ("COUNTRY", "INDICATOR", "FREQUENCY"):
+    # 5) 维度值统一 & 过滤（双保险）
+    for c in ("COUNTRY","INDICATOR","FREQUENCY"):
         if c in df.columns:
             df[c] = df[c].map(_code_id)
-
-    # 过滤频率、国家（双保险）
     if "FREQUENCY" in df.columns:
         df = df[df["FREQUENCY"].astype(str).str.upper().eq(freq)]
     if "COUNTRY" in df.columns:
@@ -193,11 +197,9 @@ def fetch_il_wide(
     if df.empty:
         return pd.DataFrame(columns=["Date"])
 
-    # 规范时间 + 透视成宽表
+    # 6) 规范时间、转宽表、排序、去全空列
     df["Date"] = normalize_timeperiod(df["TIME_PERIOD"], freq)
     wide = df.pivot_table(index="Date", columns="INDICATOR", values="value", aggfunc="first").reset_index()
-
-    # 排序 + 去全空列
     wide["__sort"] = wide["Date"].map(lambda x: sort_key_for_date(x, freq))
     wide = wide.sort_values("__sort").drop(columns="__sort").reset_index(drop=True)
     keep = ["Date"] + [c for c in wide.columns if c != "Date" and pd.to_numeric(wide[c], errors="coerce").notna().any()]
@@ -276,6 +278,7 @@ def api_il_wide():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=False)
+
 
 
 
