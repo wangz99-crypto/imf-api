@@ -107,7 +107,7 @@ def sort_key_for_date(date_str, freq):
 
 # ========== 主函数 ==========
 def fetch_il_wide(dataset=DATASET, country=COUNTRY, freq=FREQ, start=START, indicators=None):
-    imf = sdmx.Client("IMF_DATA")
+    imf = sdmx.Request("IMF")   # pandasdmx 的用法
     flow = imf.dataflow(dataset)
     dsd_id = flow.dataflow[dataset].structure.id
     sm = imf.datastructure(dsd_id, params={"references": "descendants"})
@@ -246,4 +246,5 @@ def api_il_wide():
 if __name__ == "__main__":
     # 本地调试
     app.run(host="0.0.0.0", port=8000, debug=False)
+
 
