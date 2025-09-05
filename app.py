@@ -146,6 +146,13 @@ import requests
 
 IMF_BASE_URL = os.getenv("IMF_BASE_URL", "https://sdmxcentral.imf.org/ws/public/sdmxapi/rest")
 
+def _get_sdmx_bytes(url, headers, params):
+    """请求 SDMX 数据，返回 bytes；对 404/500 做兜底重试。"""
+    r = requests.get(url, headers=headers, params=params, timeout=60)
+    if r.status_code >= 400:
+        raise requests.HTTPError(f"{r.status_code} for {url}", response=r)
+    return r.content
+
 def fetch_il_wide(
     dataset=DATASET,
     country=DEFAULT_COUNTRY,
@@ -159,34 +166,52 @@ def fetch_il_wide(
         return pd.DataFrame(columns=["Date"])
     ind_key = "+".join(inds)
 
-    # 2) 构造 SDMX REST /data URL（只打 data，不打 dataflow/datastructure）
-    # 位置键：FREQUENCY.COUNTRY.INDICATOR
+    # 2) 位置键：FREQUENCY.COUNTRY.INDICATOR
     key = f"{freq}.{country}.{ind_key}"
+
+    # 3) 请求参数与头（要求 XML 以便 pandasdmx 解析）
+    H = _auth_header()
+    H.setdefault("Accept", "application/vnd.sdmx.structure+xml, application/vnd.sdmx.data+csv, application/xml;q=0.9, */*;q=0.1")
     params = {
         "startPeriod": start,
         "detail": "dataonly",
-        # 也可以加压缩： "compress": "true"
+        # "compress": "true",  # 如需压缩可开启
     }
-    H = _auth_header()
-    url = f"{IMF_BASE_URL}/{dataset}/{key}"
 
-    # 3) 请求 SDMX-ML 数据并解析
-    r = requests.get(url, headers=H, params=params, timeout=60)
-    r.raise_for_status()
+    # 4) 先走带 agency 的路径，再回退到不带 agency 的
+    urls_to_try = [
+        f"{IMF_BASE_URL}/data/IMF/{dataset}/{key}",  # 优先：/data/IMF/IL/...
+        f"{IMF_BASE_URL}/data/{dataset}/{key}",      # 回退：/data/IL/...
+    ]
 
-    # 解析成 pandasdmx Message
-    msg = sdmx.read_sdmx(io.BytesIO(r.content))
+    last_err = None
+    content = None
+    for u in urls_to_try:
+        try:
+            content = _get_sdmx_bytes(u, headers=H, params=params)
+            last_err = None
+            break
+        except requests.HTTPError as e:
+            last_err = e
+            continue
+
+    if last_err is not None:
+        # 把更清晰的错误抛出去，便于接口返回 JSON
+        raise RuntimeError(f"IMF data endpoint failed: {last_err}")
+
+    # 5) 解析 SDMX 到 pandas
+    msg = sdmx.read_sdmx(io.BytesIO(content))
     obj = sdmx.to_pandas(msg)
     if obj is None or (hasattr(obj, "size") and obj.size == 0):
         return pd.DataFrame(columns=["Date"])
 
     df = obj.rename("value").reset_index() if isinstance(obj, pd.Series) else obj.reset_index()
 
-    # 4) 只留必要列
+    # 6) 只留必要列
     need = [c for c in ["TIME_PERIOD","FREQUENCY","COUNTRY","INDICATOR","value"] if c in df.columns]
     df = df[need].copy()
 
-    # 5) 维度值统一 & 过滤（双保险）
+    # 7) 维度值统一 & 过滤（双保险）
     for c in ("COUNTRY","INDICATOR","FREQUENCY"):
         if c in df.columns:
             df[c] = df[c].map(_code_id)
@@ -197,14 +222,13 @@ def fetch_il_wide(
     if df.empty:
         return pd.DataFrame(columns=["Date"])
 
-    # 6) 规范时间、转宽表、排序、去全空列
+    # 8) 规范时间、转宽表、排序、去全空列
     df["Date"] = normalize_timeperiod(df["TIME_PERIOD"], freq)
     wide = df.pivot_table(index="Date", columns="INDICATOR", values="value", aggfunc="first").reset_index()
     wide["__sort"] = wide["Date"].map(lambda x: sort_key_for_date(x, freq))
     wide = wide.sort_values("__sort").drop(columns="__sort").reset_index(drop=True)
     keep = ["Date"] + [c for c in wide.columns if c != "Date" and pd.to_numeric(wide[c], errors="coerce").notna().any()]
     return wide[keep]
-
 
 # ===== Flask =====
 app = Flask(__name__)
@@ -278,6 +302,7 @@ def api_il_wide():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=False)
+
 
 
 
