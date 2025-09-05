@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-import os, re, json, base64, traceback
+import os, re, json, base64, io, traceback
 import pandas as pd
 import pandasdmx as sdmx
 import requests
 from flask import Flask, request, Response, jsonify
 from msal import PublicClientApplication, SerializableTokenCache
 
-# ===== IMF B2C 基本配置 =====
+# ===================== 基本配置 =====================
 CLIENT_ID = os.getenv("IMF_CLIENT_ID", "446ce2fa-88b1-436c-b8e6-94491ca4f6fb")
 AUTHORITY = os.getenv(
     "IMF_AUTHORITY",
@@ -17,7 +17,9 @@ SCOPE = os.getenv(
     "https://imfprdb2c.onmicrosoft.com/4042e178-3e2f-4ff9-ac38-1276c901c13d/iData.Login",
 )
 
-# ===== 路径兜底：先 /var/data，失败回退到源码目录，再不行 /tmp =====
+# IMF SDMX REST 根；可用环境变量覆盖
+IMF_BASE_URL = os.getenv("IMF_BASE_URL", "https://sdmxcentral.imf.org/ws/public/sdmxapi/rest")
+
 def _ensure_writable(path: str, fallback_dir="/opt/render/project/src", last_resort="/tmp") -> str:
     d = os.path.dirname(path) or "."
     try:
@@ -37,7 +39,7 @@ def _ensure_writable(path: str, fallback_dir="/opt/render/project/src", last_res
 
 TOKEN_CACHE_PATH = _ensure_writable(os.getenv("TOKEN_CACHE_PATH", "/var/data/token_cache.json"))
 
-# ===== 若提供了 TOKEN_CACHE_B64，就在启动时写入文件 =====
+# 若提供了 TOKEN_CACHE_B64，就在启动时写入文件
 b64 = os.getenv("TOKEN_CACHE_B64")
 if b64 and not os.path.exists(TOKEN_CACHE_PATH):
     try:
@@ -46,7 +48,7 @@ if b64 and not os.path.exists(TOKEN_CACHE_PATH):
     except Exception:
         pass
 
-# ===== 初始化 MSAL（只用缓存，不交互登录）=====
+# ===================== MSAL（仅缓存，静默续期） =====================
 _token_cache = SerializableTokenCache()
 if os.path.exists(TOKEN_CACHE_PATH):
     try:
@@ -63,23 +65,23 @@ def _persist_cache():
         pass
 
 def _auth_header():
-    """从缓存静默取 token；失败则给出 401 提示你更新缓存。"""
     accts = app_msal.get_accounts()
     res = app_msal.acquire_token_silent([SCOPE], account=accts[0] if accts else None)
     if not res or "access_token" not in res:
         raise PermissionError(
             "No valid token in cache. Please run init_token.py locally and upload token_cache.json "
-            "(or set TOKEN_CACHE_B64)."
+            "or set TOKEN_CACHE_B64 in environment."
         )
     _persist_cache()
     return {"Authorization": f"{res['token_type']} {res['access_token']}"}
 
-# ===== 业务默认参数 =====
-DATASET         = os.getenv("DATASET", "IL")   # IMF International Liquidity
+# ===================== 业务参数 =====================
+DATASET         = os.getenv("DATASET", "IL")   # International Liquidity
 DEFAULT_COUNTRY = os.getenv("COUNTRY", "MRT")
 DEFAULT_FREQ    = os.getenv("FREQ", "M")       # A/Q/M
 DEFAULT_START   = os.getenv("START", "2000")
 DECIMALS        = int(os.getenv("DECIMALS", "0"))
+BATCH_SIZE      = int(os.getenv("BATCH_SIZE", "6"))  # 拉数分批大小
 
 INDICATORS_DEFAULT = [
     "RXDR_REVS","TRGMV_REVS","TRGNV_REVS","RXF11_REVS","RGOLDMV_REVS","RGOLDNV_REVS",
@@ -90,7 +92,7 @@ INDICATORS_DEFAULT = [
     "USD_OZG_MR","XDR_OZG_MR"
 ]
 
-# ===== 工具函数 =====
+# ===================== 工具函数 =====================
 def _code_id(v):
     if hasattr(v, "id"):   return v.id
     if hasattr(v, "code"): return v.code
@@ -140,47 +142,78 @@ def sort_key_for_date(date_str: str, freq: str) -> int:
     ts = pd.to_datetime(f"{s}-01-01" if freq == "A" else f"{s}-01", errors="coerce")
     return ts.toordinal() if pd.notnull(ts) else -10**12
 
-# ===== 取数（pandasdmx + IMF）=====
-import io, math
-import requests
-
-IMF_BASE_URL = os.getenv("IMF_BASE_URL", "https://sdmxcentral.imf.org/ws/public/sdmxapi/rest")
-
+# ===================== SDMX 拉数（多路由/多顺序/递归降级） =====================
 def _http_get_sdmx(url, headers, params):
-    """单次请求；对 404/500/501 抛出 HTTPError（上层决定是否重试/换路径）"""
     r = requests.get(url, headers=headers, params=params, timeout=60)
     if r.status_code >= 400:
         raise requests.HTTPError(f"{r.status_code} for {url}", response=r)
     return r.content
 
-def _try_fetch_block(dataset, key_str, headers, params):
-    """
-    兼容两种路径：
-      1) .../data/IMF/{dataset}/{key}
-      2) .../data/{dataset}/{key}
-    返回 bytes
-    """
-    paths = [
+def _try_one_key(dataset, key_str, headers, params):
+    urls = [
         f"{IMF_BASE_URL}/data/IMF/{dataset}/{key_str}",
         f"{IMF_BASE_URL}/data/{dataset}/{key_str}",
     ]
     last_err = None
-    for u in paths:
+    for u in urls:
         try:
             return _http_get_sdmx(u, headers, params)
         except requests.HTTPError as e:
-            last_err = e
-            # 只有 404/500/501 我们换一个路径重试；其他错误直接抛
+            code = getattr(e.response, "status_code", None)
+            if code in (404, 500, 501):
+                last_err = e
+                continue
+            raise
+    raise last_err or RuntimeError("Unknown error")
+
+def _fetch_batch(dataset, country, freq, indicators, headers, params):
+    """
+    针对一批 indicator：
+      1) 尝试维度顺序 A：FREQ.COUNTRY.INDICATOR
+      2) 尝试维度顺序 B：COUNTRY.FREQ.INDICATOR
+      3) 若失败且批量>1 → 递归二分
+      4) 若==1 仍失败 → 抛错
+    成功返回该批次的宽表 DataFrame
+    """
+    ind_key = "+".join(indicators)
+    key_A = f"{freq}.{country}.{ind_key}"
+    key_B = f"{country}.{freq}.{ind_key}"
+
+    for key_str in (key_A, key_B):
+        try:
+            content = _try_one_key(dataset, key_str, headers, params)
+            msg = sdmx.read_sdmx(io.BytesIO(content))
+            obj = sdmx.to_pandas(msg)
+            if obj is None or (hasattr(obj, "size") and obj.size == 0):
+                raise RuntimeError("empty")
+            df = obj.rename("value").reset_index() if isinstance(obj, pd.Series) else obj.reset_index()
+            need = [c for c in ["TIME_PERIOD","FREQUENCY","COUNTRY","INDICATOR","value"] if c in df.columns]
+            df = df[need].copy()
+            for c in ("COUNTRY","INDICATOR","FREQUENCY"):
+                if c in df.columns:
+                    df[c] = df[c].map(_code_id)
+            df["Date"] = normalize_timeperiod(df["TIME_PERIOD"], freq)
+            wide = df.pivot_table(index="Date", columns="INDICATOR", values="value", aggfunc="first").reset_index()
+            return wide
+        except requests.HTTPError as e:
             code = getattr(e.response, "status_code", None)
             if code not in (404, 500, 501):
                 raise
-            continue
-    # 两个路径都失败
-    raise RuntimeError(f"IMF data endpoint failed: {last_err}")
+            last_err = e
+        except Exception:
+            last_err = RuntimeError("parse_failed")
 
-def _chunked(seq, size):
-    for i in range(0, len(seq), size):
-        yield seq[i:i+size]
+    if len(indicators) > 1:
+        mid = len(indicators) // 2
+        left  = _fetch_batch(dataset, country, freq, indicators[:mid], headers, params)
+        right = _fetch_batch(dataset, country, freq, indicators[mid:], headers, params)
+        if left is None and right is None:
+            raise last_err
+        if left is None:  return right
+        if right is None: return left
+        return left.merge(right, on="Date", how="outer")
+
+    raise last_err if 'last_err' in locals() else RuntimeError("fetch failed")
 
 def fetch_il_wide(
     dataset=DATASET,
@@ -189,95 +222,61 @@ def fetch_il_wide(
     start=DEFAULT_START,
     indicators=None
 ) -> pd.DataFrame:
-    # —— 指标集合 —— #
     inds = indicators if indicators is not None else INDICATORS_DEFAULT
     if not inds:
         return pd.DataFrame(columns=["Date"])
 
-    # —— 公共头与参数（显式要求 SDMX 2.1 XML）—— #
     H = _auth_header()
     H.setdefault("Accept", "application/vnd.sdmx.data+xml;version=2.1, application/xml;q=0.9, */*;q=0.1")
-    params = {
-        "startPeriod": start,
-        "detail": "dataonly",
-        # "compress": "true",  # 如需启用压缩可打开
-    }
-
-    # —— 分批：每批最多 6 个指标（可按需调整）—— #
-    batch_size = int(os.getenv("BATCH_SIZE", "6"))
+    params = {"startPeriod": start, "detail": "dataonly"}
 
     frames = []
-    for batch in _chunked(inds, batch_size):
-        ind_key = "+".join(batch)                 # INDICATOR 位置的复合键：ID1+ID2+...
-        key_str = f"{freq}.{country}.{ind_key}"   # 维度顺序：FREQUENCY.COUNTRY.INDICATOR
-
-        content = _try_fetch_block(dataset, key_str, headers=H, params=params)
-
-        # 解析为 pandasdmx Message
-        msg = sdmx.read_sdmx(io.BytesIO(content))
-        obj = sdmx.to_pandas(msg)
-        if obj is None or (hasattr(obj, "size") and obj.size == 0):
+    for i in range(0, len(inds), BATCH_SIZE):
+        sub = inds[i:i+BATCH_SIZE]
+        try:
+            w = _fetch_batch(dataset, country, freq, sub, headers=H, params=params)
+            if w is not None and not w.empty:
+                frames.append(w)
+        except Exception:
+            # 该批拿不到就跳过，避免整批失败
             continue
-
-        df = obj.rename("value").reset_index() if isinstance(obj, pd.Series) else obj.reset_index()
-
-        # 只留必要列
-        need = [c for c in ["TIME_PERIOD","FREQUENCY","COUNTRY","INDICATOR","value"] if c in df.columns]
-        df = df[need].copy()
-
-        # 统一 ID
-        for c in ("COUNTRY","INDICATOR","FREQUENCY"):
-            if c in df.columns:
-                df[c] = df[c].map(_code_id)
-
-        # 双保险过滤
-        if "FREQUENCY" in df.columns:
-            df = df[df["FREQUENCY"].astype(str).str.upper().eq(freq)]
-        if "COUNTRY" in df.columns:
-            df = df[df["COUNTRY"].astype(str).str.upper().eq(country)]
-
-        if df.empty:
-            continue
-
-        # 规范时间
-        df["Date"] = normalize_timeperiod(df["TIME_PERIOD"], freq)
-
-        # 这一批转宽表
-        w = df.pivot_table(index="Date", columns="INDICATOR", values="value", aggfunc="first").reset_index()
-        frames.append(w)
 
     if not frames:
         return pd.DataFrame(columns=["Date"])
 
-    # —— 合并所有批次（按 Date 外连接）—— #
     out = frames[0]
     for w in frames[1:]:
         out = out.merge(w, on="Date", how="outer")
 
-    # 排序 + 去全空列
     out["__sort"] = out["Date"].map(lambda x: sort_key_for_date(x, freq))
     out = out.sort_values("__sort").drop(columns="__sort").reset_index(drop=True)
+
     keep = ["Date"] + [c for c in out.columns if c != "Date" and pd.to_numeric(out[c], errors="coerce").notna().any()]
-    return out[keep]
+    out = out[keep]
+    out = out.loc[:, ~out.columns.duplicated()].copy()
 
+    return out
 
-# ===== Flask =====
+# ===================== Flask 应用 & 路由 =====================
 app = Flask(__name__)
 
 @app.get("/")
 def index():
-    ready = False
     try:
         _ = _auth_header()
         ready = True
     except Exception:
         ready = False
     return jsonify({
-        "service": "IMF IL API (cache-only)",
+        "service": "IMF IL API (cache-only, robust fetch)",
         "health": "/health",
-        "data_example": "/api/il_wide?country=MRT&freq=M&start=2000&format=csv",
+        "debug_token": "/debug/token_ok",
+        "probe": "/debug/il_probe?country=MRT&freq=M&start=2000&indicator=USD_OZG_MR",
+        "data_example_csv": "/api/il_wide?country=MRT&freq=M&start=2000&format=csv",
+        "data_example_json": "/api/il_wide?country=MRT&freq=M&start=2000&format=json",
         "token_ready": ready,
-        "token_cache_path": TOKEN_CACHE_PATH
+        "token_cache_path": TOKEN_CACHE_PATH,
+        "batch_size": BATCH_SIZE
     })
 
 @app.get("/health")
@@ -296,8 +295,35 @@ def debug_token_ok():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e), "cache_path": TOKEN_CACHE_PATH}), 401
 
+@app.get("/debug/il_probe")
+def debug_il_probe():
+    """单指标探针，快速验证国家/频率/端点连通性"""
+    try:
+        country = (request.args.get("country") or DEFAULT_COUNTRY).upper().strip()
+        freq    = (request.args.get("freq") or DEFAULT_FREQ).upper().strip()
+        start   = (request.args.get("start") or DEFAULT_START).strip()
+        ind     = (request.args.get("indicator") or "USD_OZG_MR").strip()
+
+        df = fetch_il_wide(dataset=DATASET, country=country, freq=freq, start=start, indicators=[ind])
+        return jsonify({
+            "ok": True,
+            "rows": len(df),
+            "cols": df.shape[1] if not df.empty else 0,
+            "sample": df.head(5).to_dict(orient="records")
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e), "trace": traceback.format_exc().splitlines()[-6:]}), 500
+
 @app.get("/api/il_wide")
 def api_il_wide():
+    """
+    参数：
+      - country: 默认 MRT
+      - freq: A/Q/M，默认 M
+      - start: 默认 2000
+      - indicators: 逗号分隔（可选；默认 INDICATORS_DEFAULT）
+      - format: csv|json，默认 csv
+    """
     try:
         country = (request.args.get("country") or DEFAULT_COUNTRY).upper().strip()
         freq    = (request.args.get("freq") or DEFAULT_FREQ).upper().strip()
@@ -333,10 +359,3 @@ def api_il_wide():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=False)
-
-
-
-
-
-
-
